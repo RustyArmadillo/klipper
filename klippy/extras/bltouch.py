@@ -20,9 +20,88 @@ Commands = {
     'pin_up': 0.001475, 'self_test': 0.001780, 'reset': 0.002190,
 }
 
+# Defines known BLTouch versions
+DEFAULT_VERSION = "default"
+KNOWN_VERSIONS = [
+    DEFAULT_VERSION,
+    "genuine_classic_1.0",
+    "genuine_classic_1.1",
+    "genuine_classic_1.2",
+    "genuine_classic_1.3",
+    "genuine_smart_1.0",
+    "genuine_smart_2.0",
+    "genuine_smart_2.1",
+    "genuine_smart_2.2",
+    "genuine_smart_3.0",
+    "genuine_smart_3.1",
+]
+
+class FlavoredConfig:
+    """
+    FlavoredConfig provides sensible defaults for each flavor.
+    """
+
+    def __init__(self, config):
+        self._config = config
+        self.flavor = self._config.getchoice(
+            "flavor", dict(zip(KNOWN_VERSIONS, KNOWN_VERSIONS)), default=DEFAULT_VERSION
+        )
+        self.defaults = self._get_defaults()
+
+    def _get_defaults(self):
+        # defaults for any flavor
+        defaults = {
+            "pin_up_reports_not_triggered": True,
+            "pin_up_touch_mode_reports_triggered": True,
+            "keep_signal_during_probe": self.flavor.startswith("genuine"),
+            "probe_with_touch_switch_mode": self.flavor.startswith("genuine_smart")
+            and self.flavor.split("_")[-1] >= "2.1",
+        }
+
+        if (
+            self.flavor.startswith("genuine_smart")
+            and self.flavor.split("_")[-1] >= "3.1"
+        ):
+            defaults["commands"] = {
+                None: 0.0,
+                "pin_down": 0.000647,  # 647 µs (10°)
+                "touch_mode": 0.001162,  # 1162 µs (60°)
+                "pin_up": 0.001473,  # 1473 µs (90°)
+                "self_test": 0.001782,  # 1782 µs (120°)
+                "reset": 0.002194,  # 2194 µs (160°)
+            }
+        else:
+            defaults["commands"] = {
+                None: 0.0,
+                "pin_down": 0.000650,  # 650 µs (10°)
+                "touch_mode": 0.001165,  # 1165 µs (60°)
+                "pin_up": 0.001475,  # 1475 µs (90°)
+                "self_test": 0.001780,  # 1780 µs (120°)
+                "reset": 0.002190,  # 2190 µs (160°)
+            }
+
+        return defaults
+
+    def __getattr__(self, name):
+        """
+        Call the underlying ConfigWrapper and inject a flavored default value
+        when no default is given.
+        """
+        if name in ("get", "getboolean", "getfloat"):
+
+            def wrap(*args, **kwargs):
+                if "default" not in kwargs and args[0] in self.defaults:
+                    kwargs["default"] = self.defaults.get(args[0], sentinel)
+                return getattr(self._config, name)(*args, **kwargs)
+
+            return wrap
+        raise AttributeError(name)
+
+
 # BLTouch "endstop" wrapper
 class BLTouchEndstopWrapper:
     def __init__(self, config):
+        flavored_config = FlavoredConfig(config)
         self.printer = config.get_printer()
         self.printer.register_event_handler("klippy:connect",
                                             self.handle_connect)
@@ -41,13 +120,13 @@ class BLTouchEndstopWrapper:
         self.mcu_endstop = mcu.setup_pin('endstop', pin_params)
         # Setup for sensor test
         self.next_test_time = 0.
-        self.pin_up_not_triggered = config.getboolean(
-            'pin_up_reports_not_triggered', True)
-        self.pin_up_touch_triggered = config.getboolean(
-            'pin_up_touch_mode_reports_triggered', True)
+        self.pin_up_not_triggered = flavored_config.getboolean(
+            'pin_up_reports_not_triggered')
+        self.pin_up_touch_triggered = flavored_config.getboolean(
+            'pin_up_touch_mode_reports_triggered')
         self.start_mcu_pos = []
         # Calculate pin move time
-        pmt = max(config.getfloat('pin_move_time', 0.675), MIN_CMD_TIME)
+        pmt = max(flavored_config.getfloat('pin_move_time', 0.675), MIN_CMD_TIME)
         self.pin_move_time = math.ceil(pmt / SIGNAL_PERIOD) * SIGNAL_PERIOD
         # Wrappers
         self.get_mcu = self.mcu_endstop.get_mcu
@@ -60,6 +139,13 @@ class BLTouchEndstopWrapper:
         self.gcode = self.printer.lookup_object('gcode')
         self.gcode.register_command("BLTOUCH_DEBUG", self.cmd_BLTOUCH_DEBUG,
                                     desc=self.cmd_BLTOUCH_DEBUG_help)
+        self._commands = flavored_config.defaults["commands"]
+        self._keep_signal_during_probe = flavored_config.getboolean(
+            "keep_signal_during_probe"
+        )
+        self._probe_with_touch_switch_mode = flavored_config.getboolean(
+            "probe_with_touch_switch_mode"
+        )
     def _build_config(self):
         kin = self.printer.lookup_object('toolhead').get_kinematics()
         for stepper in kin.get_steppers('Z'):
@@ -90,13 +176,18 @@ class BLTouchEndstopWrapper:
         return self.next_cmd_time
     def verify_state(self, check_start_time, check_end_time, triggered, msg):
         # Perform endstop check to verify bltouch reports desired state
+        prev_positions = [
+            s.get_commanded_position() for s in self.mcu_endstop.get_steppers()
+        ]
         self.mcu_endstop.home_start(check_start_time, ENDSTOP_SAMPLE_TIME,
                                     ENDSTOP_SAMPLE_COUNT, ENDSTOP_REST_TIME,
                                     triggered=triggered)
         try:
             self.mcu_endstop.home_wait(check_end_time)
-        except self.mcu_endstop.TimeoutError as e:
+        except self.mcu_endstop.TimeoutErroras e:
             raise homing.EndstopError("BLTouch failed to %s" % (msg,))
+        for s, pos in zip(self.mcu_endstop.get_steppers(), prev_positions):
+            s.set_commanded_position(pos)
     def raise_probe(self):
         for retry in range(3):
             self.sync_mcu_print_time()
@@ -141,12 +232,13 @@ class BLTouchEndstopWrapper:
         self.sync_print_time()
         duration = max(MIN_CMD_TIME, self.pin_move_time - MIN_CMD_TIME)
         self.send_cmd('pin_down', duration=duration)
-        self.send_cmd(None)
+        if self._probe_with_touch_switch_mode:
+            self.send_cmd('touch_mode')
+        if not self._keep_signal_during_probe:
+            self.send_cmd(None)
         self.sync_print_time()
         self.mcu_endstop.home_prepare()
-        toolhead = self.printer.lookup_object('toolhead')
-        toolhead.flush_step_generation()
-        self.start_mcu_pos = [(s, s.get_mcu_position())
+        self.start_mcu_pos = [(s, s.get_mcu_position()) 
                               for s in self.mcu_endstop.get_steppers()]
     def home_finalize(self):
         self.raise_probe()
