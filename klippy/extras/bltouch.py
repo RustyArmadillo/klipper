@@ -1,3 +1,5 @@
+# coding: utf-8
+#
 # BLTouch support
 #
 # Copyright (C) 2018-2019  Kevin O'Connor <kevin@koconnor.net>
