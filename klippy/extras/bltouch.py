@@ -1,4 +1,4 @@
-# coding: utf-8
+# coding: utf8
 #
 # BLTouch support
 #
@@ -7,6 +7,7 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import math, logging
 import homing, probe
+from configfile import sentinel
 
 SIGNAL_PERIOD = 0.020
 MIN_CMD_TIME = 5 * SIGNAL_PERIOD
